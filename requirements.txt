@@ -1,0 +1,7 @@
+requests>=2.31
+python-dateutil>=2.9
+python-dotenv>=1.0
+supabase>=2.6
+# Optional — only needed if GOOGLE_SHEETS_ENABLED=true
+gspread>=6.0
+google-auth>=2.30
