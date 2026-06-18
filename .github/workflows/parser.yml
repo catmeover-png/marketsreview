@@ -1,0 +1,40 @@
+name: World Cup markets parser
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"   # every 30 minutes (UTC)
+  workflow_dispatch: {}        # manual run
+
+concurrency:
+  group: wc-parser
+  cancel-in-progress: false
+
+jobs:
+  parse:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run parser
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          # Optional Google Sheets mirror
+          GOOGLE_SHEETS_ENABLED: ${{ vars.GOOGLE_SHEETS_ENABLED }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON_BASE64: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON_BASE64 }}
+          # Precision discovery hints (set these as repo Variables)
+          POLY_TAG_IDS: ${{ vars.POLY_TAG_IDS }}            # e.g. 102232 (FIFA World Cup)
+          POLY_TAG_SLUGS: ${{ vars.POLY_TAG_SLUGS }}
+          KALSHI_SERIES_TICKERS: ${{ vars.KALSHI_SERIES_TICKERS }}  # e.g. KXWCGAME
+          ADI_ASSUME_WORLD_CUP: ${{ vars.ADI_ASSUME_WORLD_CUP }}
+        run: python parser.py
