@@ -86,6 +86,14 @@ ENABLE_KALSHI = _env_bool("ENABLE_KALSHI", True)
 ENABLE_ADI = _env_bool("ENABLE_ADI", True)
 ENABLE_LIMITLESS = _env_bool("ENABLE_LIMITLESS", True)
 
+# --- Write minimization ---
+# Snapshots are written only when a market's volume/status changed since the
+# last run, and (by default) only for markets that belong to a cross-platform
+# group — that's the only data a "current volumes" dashboard could ever chart.
+# Set ENABLE_SNAPSHOTS=false to skip the history table entirely.
+ENABLE_SNAPSHOTS = _env_bool("ENABLE_SNAPSHOTS", True)
+SNAPSHOT_GROUPS_ONLY = _env_bool("SNAPSHOT_GROUPS_ONLY", True)
+
 # --- Google Sheets (optional mirror) ---
 GOOGLE_SHEETS_ENABLED = _env_bool("GOOGLE_SHEETS_ENABLED", False)
 GOOGLE_SHEET_ID = _env("GOOGLE_SHEET_ID")
@@ -1192,6 +1200,50 @@ _MARKET_COLUMNS = (
 )
 
 
+def _read_platform_state(sb, platform: str) -> dict[str, dict]:
+    """
+    Read ALL current rows for a platform (paginated — Supabase caps a single
+    response at ~1000 rows, and Polymarket alone has >11k). Returns
+    {platform_market_id: {volume_total, volume_24h, market_status, is_active}}.
+    Used both to detect volume changes and to find disappeared markets.
+    """
+    out: dict[str, dict] = {}
+    start, PAGE = 0, 1000
+    while True:
+        res = (sb.table("markets_normalized")
+                 .select("platform_market_id,volume_total,volume_24h,"
+                         "market_status,is_active")
+                 .eq("platform", platform)
+                 .range(start, start + PAGE - 1)
+                 .execute())
+        rows = res.data or []
+        for r in rows:
+            out[r["platform_market_id"]] = r
+        if len(rows) < PAGE:
+            break
+        start += PAGE
+    return out
+
+
+def _vol_eq(a: Any, b: Any) -> bool:
+    fa, fb = to_float(a), to_float(b)
+    if fa is None or fb is None:
+        return fa is fb
+    return abs(fa - fb) < 1e-9
+
+
+def _is_changed(rec: dict, prev: Optional[dict]) -> bool:
+    """True if this record is new or its volume/status/active flag moved."""
+    if prev is None:
+        return True
+    return not (
+        _vol_eq(rec.get("volume_total"), prev.get("volume_total"))
+        and _vol_eq(rec.get("volume_24h"), prev.get("volume_24h"))
+        and (rec.get("market_status") or "") == (prev.get("market_status") or "")
+        and bool(rec.get("is_active")) == bool(prev.get("is_active"))
+    )
+
+
 def upsert_markets(sb, records: list[dict]) -> int:
     """Upsert current-state rows on (platform, platform_market_id)."""
     if not records:
@@ -1214,7 +1266,7 @@ def upsert_markets(sb, records: list[dict]) -> int:
 
 
 def insert_snapshots(sb, records: list[dict]) -> int:
-    """Insert one snapshot row per observed market."""
+    """Insert one snapshot row per supplied market (caller filters to changed)."""
     if not records:
         return 0
     now = NOW()
@@ -1235,18 +1287,15 @@ def insert_snapshots(sb, records: list[dict]) -> int:
     return written
 
 
-def mark_missing_inactive(sb, platform: str, seen_ids: set[str]) -> int:
+def mark_missing_inactive(sb, platform: str, seen_ids: set[str],
+                          prev_state: dict[str, dict]) -> int:
     """
     Mark previously-active markets of this platform that were NOT seen this run
-    as inactive (never delete). Diff is computed in Python to avoid huge NOT IN.
+    as inactive (never delete). Uses the already-read state (fully paginated),
+    so it stays correct even with >1000 active rows.
     """
-    res = (sb.table("markets_normalized")
-             .select("platform_market_id")
-             .eq("platform", platform)
-             .eq("is_active", True)
-             .execute())
-    db_ids = {row["platform_market_id"] for row in (res.data or [])}
-    to_close = list(db_ids - seen_ids)
+    active_ids = {pid for pid, r in prev_state.items() if r.get("is_active")}
+    to_close = list(active_ids - seen_ids)
     if not to_close:
         return 0
     now = NOW()
@@ -1358,20 +1407,47 @@ def main() -> None:
     # Cross-platform enrichment: canonical keys for grouping.
     enrich_records(all_records)
 
-    # Persist current state + snapshots.
+    # Read current DB state once per platform (paginated), then write only what
+    # actually changed. Keeps current-state + group volumes fresh while the
+    # append-only snapshots table stays tiny.
+    prev_state: dict[str, dict] = {}
+    for platform in seen_by_platform:
+        try:
+            prev_state[platform] = _read_platform_state(sb, platform)
+        except Exception:
+            log.exception("%s: state read failed", platform)
+            prev_state[platform] = {}
+
+    changed = [
+        r for r in all_records
+        if _is_changed(r, prev_state.get(r["platform"], {}).get(r["platform_market_id"]))
+    ]
+
+    # Persist only changed current-state rows.
     upserted = snap = 0
     try:
-        upserted = upsert_markets(sb, all_records)
-        snap = insert_snapshots(sb, all_records)
+        upserted = upsert_markets(sb, changed)
     except Exception:
         log.exception("storage write failed")
         raise
 
-    # Mark missing-as-inactive only for platforms we actually fetched OK.
+    # Snapshot only changed markets, and (by default) only group members —
+    # the only rows a current-volumes dashboard could chart over time.
+    if ENABLE_SNAPSHOTS:
+        snap_src = [r for r in changed
+                    if (not SNAPSHOT_GROUPS_ONLY) or r.get("group_key")]
+        try:
+            snap = insert_snapshots(sb, snap_src)
+        except Exception:
+            log.exception("snapshot write failed")
+
+    # Mark missing-as-inactive only for platforms we actually fetched OK,
+    # reusing the state we already read.
     closed_total = 0
     for platform in seen_by_platform:
         try:
-            closed = mark_missing_inactive(sb, platform, seen_by_platform[platform])
+            closed = mark_missing_inactive(
+                sb, platform, seen_by_platform[platform], prev_state.get(platform, {}))
             closed_total += closed
             summary.append(f"{platform}: closed {closed}")
         except Exception:
@@ -1393,7 +1469,7 @@ def main() -> None:
     log.info("=== RUN SUMMARY (%.1fs) ===", dt)
     for line in summary:
         log.info("  %s", line)
-    log.info("  upserted=%d snapshots=%d closed=%d total_records=%d",
+    log.info("  changed/upserted=%d snapshots=%d closed=%d fetched=%d",
              upserted, snap, closed_total, len(all_records))
 
 
