@@ -37,4 +37,5 @@ jobs:
           POLY_TAG_SLUGS: ${{ vars.POLY_TAG_SLUGS }}
           KALSHI_SERIES_TICKERS: ${{ vars.KALSHI_SERIES_TICKERS }}  # e.g. KXWCGAME
           ADI_ASSUME_WORLD_CUP: ${{ vars.ADI_ASSUME_WORLD_CUP }}
+          ENABLE_SNAPSHOTS: ${{ vars.ENABLE_SNAPSHOTS }}
         run: python parser.py
