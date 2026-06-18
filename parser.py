@@ -956,6 +956,28 @@ def canon_team(name: Optional[str]) -> Optional[str]:
     return letters[:16]
 
 
+def known_team(name: Optional[str]) -> Optional[str]:
+    """
+    Strict team resolver for KEYING: returns a code only if `name` is a known
+    World Cup nation (in TEAM_ALIASES) or a clean 3-letter code. Unknowns return
+    None — unlike canon_team's slug fallback. This stops Limitless/Polymarket
+    prop titles (e.g. "Ronaldo to record 5 duels won vs Congo DR") from being
+    split into pseudo-teams and grouped: the player-phrase side resolves to None,
+    so no match_key/group_key forms and the prop is correctly left ungrouped.
+    """
+    if not name:
+        return None
+    raw = name.strip()
+    letters = re.sub(r"[^a-z]", "", raw.lower())
+    if not letters:
+        return None
+    if letters in TEAM_ALIASES:
+        return TEAM_ALIASES[letters]
+    if re.fullmatch(r"[A-Za-z]{3}", raw):
+        return raw.upper()
+    return None
+
+
 _STAT_RE = re.compile(
     r"\b(shots?|assists?|saves?|tackles?|passes?|cards?|fouls?|offsides?|"
     r"clearances?|interceptions?|touches?|crosses?)\b", re.IGNORECASE
@@ -967,9 +989,9 @@ def _title_is_team_or_draw(t: str, team_a: Optional[str], team_b: Optional[str])
     bare = re.sub(r"[^a-z]", "", t)
     if bare in ("draw", "tie"):
         return True
-    ct = canon_team(t)  # canon of whole title; bridges 'Brazil' vs code 'BRA'
+    ct = known_team(t)  # strict: only a real team name counts, not a slug
     for name in (team_a, team_b):
-        c = canon_team(name)
+        c = known_team(name)
         if c and ct and ct == c:
             return True
     return False
@@ -1071,7 +1093,10 @@ GROUPABLE_TYPES = {"match_winner", "correct_score", "total_goals", "btts"}
 
 def compute_keys(rec: dict) -> tuple[Optional[str], Optional[str], str, str]:
     """Return (match_key, group_key, market_type_canon, selection)."""
-    ca, cb = canon_team(rec.get("team_a")), canon_team(rec.get("team_b"))
+    # Strict resolver: both sides must be real, known WC teams to form any key.
+    # This is what keeps prop titles (one side is a player phrase → None) out of
+    # the groups entirely.
+    ca, cb = known_team(rec.get("team_a")), known_team(rec.get("team_b"))
     teams = sorted(x for x in (ca, cb) if x)
     # Adapters with structured metadata (e.g. ADI) can override canon directly.
     mtype = rec.get("canon_type_override") or canon_market_type(
@@ -1093,7 +1118,7 @@ def enrich_records(records: list[dict]) -> None:
     """Attach match_key / group_key / market_type_canon / selection in place."""
     for r in records:
         mk, gk, mtype, sel = compute_keys(r)
-        ca, cb = canon_team(r.get("team_a")), canon_team(r.get("team_b"))
+        ca, cb = known_team(r.get("team_a")), known_team(r.get("team_b"))
         teams = sorted(x for x in (ca, cb) if x)
         r["match_key"] = mk
         r["group_key"] = gk
