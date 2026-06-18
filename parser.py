@@ -286,7 +286,7 @@ def make_record(**kw: Any) -> dict:
         "volume_24h": to_float(kw.get("volume_24h")),
         "volume_currency": kw.get("volume_currency"),
         "raw_updated_at": kw.get("raw_updated_at"),
-        "raw_json": raw if isinstance(raw, (dict, list)) else None,
+        "raw_json": None,
     }
 
 
@@ -1407,48 +1407,53 @@ def insert_snapshots(sb, records: list[dict]) -> int:
     return written
 
 
-def mark_missing_inactive(sb, platform: str, seen_ids: set[str],
-                          prev_state: dict[str, dict]) -> int:
-    """
-    Mark previously-active markets of this platform that were NOT seen this run
-    as inactive (never delete). Uses the already-read state (fully paginated),
-    so it stays correct even with >1000 active rows.
-    """
-    active_ids = {pid for pid, r in prev_state.items() if r.get("is_active")}
-    to_close = list(active_ids - seen_ids)
-    if not to_close:
-        return 0
-    now = NOW()
-    for chunk in _chunks(to_close, 100):
-        (sb.table("markets_normalized")
-            .update({"is_active": False, "market_status": "inactive",
-                     "updated_at": now})
+def delete_missing(sb, platform: str, seen_ids: set[str], prev_state: dict[str, dict]) -> int:
+    db_ids = set(prev_state.keys())
+    to_delete = list(db_ids - seen_ids)
+
+    for chunk in _chunks(to_delete, 100):
+        (
+            sb.table("markets_normalized")
+            .delete()
             .eq("platform", platform)
             .in_("platform_market_id", chunk)
-            .execute())
-    return len(to_close)
+            .execute()
+        )
+
+    return len(to_delete)
 
 
 def upsert_groups(sb, groups: list[dict]) -> int:
-    """Upsert cross-platform groups on group_key, then mark missing inactive."""
+    """Upsert current cross-platform groups, then delete groups missing this run."""
     now = NOW()
     seen = {g["group_key"] for g in groups}
-    rows = [{**g, "updated_at": now} for g in groups]
-    for chunk in _chunks(rows, 500):
-        sb.table("market_groups").upsert(chunk, on_conflict="group_key").execute()
 
-    # Mark groups that have no active members this run as inactive.
-    res = (sb.table("market_groups")
-             .select("group_key")
-             .eq("is_active", True)
-             .execute())
+    rows = [{**g, "updated_at": now} for g in groups]
+
+    for chunk in _chunks(rows, 500):
+        sb.table("market_groups").upsert(
+            chunk,
+            on_conflict="group_key"
+        ).execute()
+
+    # Delete groups that no longer exist in current run.
+    res = (
+        sb.table("market_groups")
+        .select("group_key")
+        .execute()
+    )
+
     db_keys = {row["group_key"] for row in (res.data or [])}
-    to_close = list(db_keys - seen)
-    for chunk in _chunks(to_close, 100):
-        (sb.table("market_groups")
-            .update({"is_active": False, "platform_count": 0, "updated_at": now})
+    to_delete = list(db_keys - seen)
+
+    for chunk in _chunks(to_delete, 100):
+        (
+            sb.table("market_groups")
+            .delete()
             .in_("group_key", chunk)
-            .execute())
+            .execute()
+        )
+
     return len(rows)
 
 
@@ -1566,13 +1571,7 @@ def main() -> None:
     closed_total = 0
     for platform in seen_by_platform:
         try:
-            closed = mark_missing_inactive(
-                sb, platform, seen_by_platform[platform], prev_state.get(platform, {}))
-            closed_total += closed
-            summary.append(f"{platform}: closed {closed}")
-        except Exception:
-            log.exception("%s: mark-inactive failed", platform)
-
+            closed = delete_missing(sb, platform, seen_by_platform[platform], prev_state.get(platform, {}))
     # Build + persist cross-platform groups (same bet across platforms).
     groups = build_groups(all_records)
     multi = sum(1 for g in groups if g["platform_count"] >= 2)
