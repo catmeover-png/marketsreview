@@ -23,6 +23,7 @@ import os
 import re
 import sys
 import time
+import unicodedata
 from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any, Iterable, Optional
@@ -206,6 +207,27 @@ def parse_teams(title: Optional[str]) -> tuple[Optional[str], Optional[str]]:
         if a and b and len(a) < 40 and len(b) < 40:
             return a, b
     return None, None
+    
+def parse_lmts_teams(title: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    """
+    Limitless titles often look like:
+    'World Cup, Uruguay vs Cape Verde Islands, Jun 21, 2026'
+    """
+    if not title:
+        return None, None
+
+    t = title.strip()
+
+    m = re.search(
+        r"^(?:world cup,\s*)?(.+?)\s+vs\.?\s+(.+?)(?:,\s+[A-Z][a-z]{2}\s+\d{1,2},\s+\d{4})?$",
+        t,
+        re.IGNORECASE,
+    )
+
+    if m:
+        return _clean_team(m.group(1)), _clean_team(m.group(2))
+
+    return parse_teams(title)
 
 
 def text_is_world_cup(*chunks: Optional[str]) -> bool:
@@ -761,13 +783,16 @@ def _lmts_record(m: dict, parent: Optional[dict] = None) -> Optional[dict]:
     slug = m.get("slug") or (str(m.get("id")) if m.get("id") else None)
     if not slug:
         return None
+
     title = m.get("title") or ""
-    # У ребёнка группы title — это исход; «Team A vs Team B» лежит на родителе.
     match_title = (parent or {}).get("title") or title
-    team_a, team_b = parse_teams(match_title)
+
+    team_a, team_b = parse_lmts_teams(match_title)
+
     expired = bool(m.get("expired"))
     cond = m.get("conditionId") or (parent or {}).get("conditionId")
-    return make_record(
+
+    rec = make_record(
         platform=PLATFORM_LMTS,
         platform_market_id=slug,
         platform_event_id=(str(cond) if cond else None),
@@ -783,11 +808,22 @@ def _lmts_record(m: dict, parent: Optional[dict] = None) -> Optional[dict]:
         market_status=m.get("status") or ("expired" if expired else "active"),
         is_active=not expired,
         volume_total=to_float(m.get("volumeFormatted") or m.get("volume")),
-        volume_24h=None,  # не отдаётся
+        volume_24h=None,
         volume_currency="USDC",
         raw_json=m,
     )
 
+    # У Limitless parent = матч, child = исход: Uruguay / Draw / Cape Verde
+    if parent:
+        child_title = (title or "").strip()
+
+        if _title_is_team_or_draw(child_title, team_a, team_b):
+            rec["canon_type_override"] = "match_winner"
+            rec["canon_sel_override"] = canon_selection(
+                "match_winner", child_title, team_a, team_b
+            )
+
+    return rec
 
 def fetch_limitless() -> list[dict]:
     """
@@ -817,7 +853,7 @@ def fetch_limitless() -> list[dict]:
         host = parent or src
         cats = " ".join(str(c) for c in (host.get("categories") or []))
         tags = " ".join(str(t) for t in (host.get("tags") or []))
-        ta, tb = parse_teams(ptitle or title)
+        ta, tb = parse_lmts_teams(ptitle or title)
         if not (text_is_world_cup(title, ptitle, cats, tags, rec["platform_market_id"])
                 or (ta and tb)):
             return
@@ -987,6 +1023,7 @@ TEAM_ALIASES: dict[str, str] = {
     "trinidadandtobago": "TRI", "tri": "TRI",
     "suriname": "SUR", "sur": "SUR",
     "nicaragua": "NCA", "nca": "NCA",
+    "capeverdeislands": "CPV",
 }
 
 
