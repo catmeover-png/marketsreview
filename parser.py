@@ -808,7 +808,14 @@ def _lmts_record(m: dict, parent: Optional[dict] = None) -> Optional[dict]:
         market_status=m.get("status") or ("expired" if expired else "active"),
         is_active=not expired,
         volume_total=to_float(m.get("volumeFormatted") or m.get("volume")),
-        volume_24h=None,
+        volume_24h=to_float(
+            m.get("volume24h")
+            or m.get("volume_24h")
+            or m.get("volume24Hr")
+            or m.get("volume24hr")
+            or m.get("dailyVolume")
+            or m.get("dayVolume")
+        ),
         volume_currency="USDC",
         raw_json=m,
     )
@@ -1264,6 +1271,7 @@ def build_groups(records: list[dict]) -> list[dict]:
     for g in buckets.values():
         platforms = sorted(g.pop("_platforms"))
         volumes = {p: {"total": round(v["total"], 4),
+                       "volume_24h": round(v["h24"], 4)
                        "h24": round(v["h24"], 4),
                        "currency": v["currency"]}
                    for p, v in g.pop("_vol").items()}
