@@ -2,7 +2,7 @@ name: World Cup markets parser
 
 on:
   schedule:
-    - cron: "*/30 * * * *"   # every 30 minutes (UTC)
+    - cron: "*/59 * * * *"   # every 30 minutes (UTC)
   workflow_dispatch: {}        # manual run
 
 concurrency:
