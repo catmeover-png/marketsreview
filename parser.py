@@ -67,6 +67,14 @@ def _env_int(key: str, default: int) -> int:
         return default
 
 
+def _env_float(key: str, default: float) -> float:
+    raw = os.getenv(key)
+    try:
+        return float(raw) if raw else default
+    except ValueError:
+        return default
+
+
 # --- Supabase ---
 SUPABASE_URL = _env("SUPABASE_URL", required=True)
 SUPABASE_KEY = _env("SUPABASE_KEY", required=True)  # use service_role key (write)
@@ -97,9 +105,13 @@ KALSHI_API_URL = _env("KALSHI_API_URL", "https://api.elections.kalshi.com/trade-
 ADI_API_URL = _env("ADI_API_URL", "https://core-api.adipredictstreet.com")
 LMTS_API_URL = _env("LMTS_API_URL", "https://api.limitless.exchange")
 # --- Source-specific discovery hints (optional, improve precision) ---
+# Polymarket: numeric tag id(s) to query directly via /events?tag_id=<id>.
+# This is the reliable discovery path (the Gamma "FIFA World Cup" tag is 102232)
+# and avoids the deep-offset keyword scan that 422s past ~offset 2000.
+POLY_TAG_IDS = [s.strip() for s in _env("POLY_TAG_IDS").split(",") if s.strip()]
 # Polymarket: comma-separated tag slugs to query directly, e.g. "world-cup".
 POLY_TAG_SLUGS = [s.strip() for s in _env("POLY_TAG_SLUGS").split(",") if s.strip()]
-POLY_MAX_PAGES = _env_int("POLY_MAX_PAGES", 50)  # keyword-scan page cap
+POLY_MAX_PAGES = _env_int("POLY_MAX_PAGES", 50)  # page cap (any discovery mode)
 # Kalshi: comma-separated series tickers for World Cup, e.g. "KXWORLDCUP".
 KALSHI_SERIES_TICKERS = [
     s.strip() for s in _env("KALSHI_SERIES_TICKERS").split(",") if s.strip()
@@ -110,9 +122,15 @@ KALSHI_MAX_PAGES = _env_int("KALSHI_MAX_PAGES", 50)
 # active tournament on ADI is the World Cup; set false to require a keyword/tag.
 ADI_ASSUME_WORLD_CUP = _env_bool("ADI_ASSUME_WORLD_CUP", True)
 ADI_TAG = _env("ADI_TAG")  # optional single tag slug to filter /api/matches
-# Limitless: automationType filter (manual | lumy | sports); empty scans all.
-LMTS_AUTOMATION_TYPE = _env("LMTS_AUTOMATION_TYPE")
-LMTS_MAX_PAGES = _env_int("LMTS_MAX_PAGES", 50)
+# Limitless: discovery via semantic search (/markets/search). Tune queries and
+# similarity floor; results still pass a WC/team sanity check.
+LMTS_SEARCH_QUERIES = [
+    q.strip() for q in
+    _env("LMTS_SEARCH_QUERIES", "FIFA World Cup,World Cup soccer").split(",")
+    if q.strip()
+]
+LMTS_SIMILARITY = _env_float("LMTS_SIMILARITY", 0.4)
+LMTS_MAX_PAGES = _env_int("LMTS_MAX_PAGES", 10)
 
 PLATFORM_POLY = "polymarket"
 PLATFORM_KALSHI = "kalshi"
@@ -157,6 +175,15 @@ def http_get_json(url: str, params: Optional[dict] = None, retries: int = 3) -> 
 _VS_SPLIT = re.compile(r"\s+(?:vs\.?|v\.?|—|–|@)\s+", re.IGNORECASE)
 
 
+def _clean_team(s: str) -> str:
+    """Strip category suffixes Polymarket appends, e.g. 'Haiti - Player Props'."""
+    for sep in (" - ", " – ", " — ", " | ", ": ", " ("):
+        i = s.find(sep)
+        if i != -1:
+            s = s[:i]
+    return s.strip(" -–—|:")
+
+
 def parse_teams(title: Optional[str]) -> tuple[Optional[str], Optional[str]]:
     """Best-effort extraction of (team_a, team_b) from a match-style title."""
     if not title:
@@ -165,8 +192,8 @@ def parse_teams(title: Optional[str]) -> tuple[Optional[str], Optional[str]]:
     core = re.split(r"[:(]", title, maxsplit=1)[0].strip()
     parts = _VS_SPLIT.split(core)
     if len(parts) == 2:
-        a, b = parts[0].strip(" -"), parts[1].strip(" -")
-        if a and b and len(a) < 60 and len(b) < 60:
+        a, b = _clean_team(parts[0]), _clean_team(parts[1])
+        if a and b and len(a) < 40 and len(b) < 40:
             return a, b
     return None, None
 
@@ -266,7 +293,7 @@ def _poly_normalize_event(ev: dict) -> list[dict]:
             team_a=m_team_a or team_a,
             team_b=m_team_b or team_b,
             market_title=m_title,
-            market_type="match_winner" if (m_team_a or team_a) else "binary",
+            market_type=m.get("marketType"),  # raw; canon derived from title later
             market_url=_poly_market_url(ev_slug),
             event_start_time=ev_start,
             market_status="closed" if closed else "open",
@@ -280,61 +307,76 @@ def _poly_normalize_event(ev: dict) -> list[dict]:
     return out
 
 
+def _coerce_events(payload: Any) -> list[dict]:
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        return payload.get("data") or payload.get("events") or []
+    return []
+
+
+def _poly_paginate(base_params: dict) -> list[dict]:
+    """
+    Page /events with the given filter params. Resilient: a client error on a
+    deep page (Gamma 422s past a high offset) stops pagination and returns what
+    we have so far instead of raising and dropping the whole source.
+    """
+    out: list[dict] = []
+    offset = 0
+    for _ in range(POLY_MAX_PAGES):
+        params = {**base_params, "limit": 100, "offset": offset}
+        try:
+            payload = http_get_json(f"{GAMMA_API_URL}/events", params=params)
+        except requests.HTTPError as e:
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            if status and 400 <= status < 500:
+                log.warning("polymarket: stop paging at offset %d (HTTP %s)",
+                            offset, status)
+                break
+            raise
+        page = _coerce_events(payload)
+        if not page:
+            break
+        out.extend(page)
+        if len(page) < 100:
+            break
+        offset += 100
+    return out
+
+
 def fetch_polymarket() -> list[dict]:
     """
     Discover World Cup events on Gamma and normalize their markets.
 
-    Two discovery modes:
-      1. If POLY_TAG_SLUGS set → query /events?tag_slug=<slug> (precise).
-      2. Else → page /events?closed=false and keep events whose title/slug
-         matches WORLD_CUP_KEYWORDS (page cap = POLY_MAX_PAGES).
+    Discovery modes, in priority order:
+      1. POLY_TAG_IDS  → /events?tag_id=<id>      (reliable; WC tag is 102232)
+      2. POLY_TAG_SLUGS→ /events?tag_slug=<slug>  (precise)
+      3. fallback      → page /events and keep title/slug keyword matches
+    All modes share resilient pagination (a deep-page 4xx ends paging, it does
+    not fail the source). closed=false + active=true keeps live markets only.
     """
     events: list[dict] = []
 
-    def _coerce_events(payload: Any) -> list[dict]:
-        if isinstance(payload, list):
-            return payload
-        if isinstance(payload, dict):
-            return payload.get("data") or payload.get("events") or []
-        return []
-
-    if POLY_TAG_SLUGS:
+    if POLY_TAG_IDS:
+        for tid in POLY_TAG_IDS:
+            events.extend(_poly_paginate(
+                {"closed": "false", "active": "true", "tag_id": tid}))
+        log.info("polymarket: %d events via tag ids %s", len(events), POLY_TAG_IDS)
+    elif POLY_TAG_SLUGS:
         for slug in POLY_TAG_SLUGS:
-            offset = 0
-            while True:
-                payload = http_get_json(
-                    f"{GAMMA_API_URL}/events",
-                    params={"closed": "false", "tag_slug": slug,
-                            "limit": 100, "offset": offset},
-                )
-                page = _coerce_events(payload)
-                events.extend(page)
-                if len(page) < 100:
-                    break
-                offset += 100
+            events.extend(_poly_paginate(
+                {"closed": "false", "active": "true", "tag_slug": slug}))
         log.info("polymarket: %d events via tag slugs %s", len(events), POLY_TAG_SLUGS)
     else:
-        offset = 0
-        for _ in range(POLY_MAX_PAGES):
-            payload = http_get_json(
-                f"{GAMMA_API_URL}/events",
-                params={"closed": "false", "limit": 100, "offset": offset,
-                        "order": "startDate", "ascending": "false"},
-            )
-            page = _coerce_events(payload)
-            if not page:
-                break
-            for ev in page:
-                if text_is_world_cup(ev.get("title"), ev.get("slug"),
-                                     ev.get("description")):
-                    events.append(ev)
-            if len(page) < 100:
-                break
-            offset += 100
-        log.info("polymarket: %d World Cup events found by keyword scan", len(events))
-        # TODO: keyword scan can miss events outside the most-recent window.
-        # For production precision, set POLY_TAG_SLUGS to the World Cup tag slug
-        # (discover it via GET /tags or the event page URL on polymarket.com).
+        page_all = _poly_paginate(
+            {"closed": "false", "active": "true",
+             "order": "startDate", "ascending": "false"})
+        events = [ev for ev in page_all
+                  if text_is_world_cup(ev.get("title"), ev.get("slug"))]
+        log.info("polymarket: %d World Cup events of %d scanned (keyword)",
+                 len(events), len(page_all))
+        # For precision/cost set POLY_TAG_IDS=102232 (the Gamma FIFA World Cup
+        # tag) so discovery skips the full-catalog scan entirely.
 
     records: list[dict] = []
     seen: set[str] = set()
@@ -466,6 +508,67 @@ def _adi_market_url(market_slug: Optional[str], event_slug: Optional[str]) -> Op
     return f"https://app.adipredictstreet.com/markets/{slug}" if slug else None
 
 
+def _adi_canon_type(tags: list) -> Optional[str]:
+    """Derive canonical market type from ADI tags (e.g. MONEYLINE)."""
+    blob = " ".join(
+        ((t.get("name") or "") + " " + (t.get("slug") or "")).lower()
+        for t in (tags or []) if isinstance(t, dict)
+    )
+    if any(w in blob for w in ("moneyline", "1x2", "match winner",
+                               "match-winner", "match result")):
+        return "match_winner"
+    if "correct" in blob and "score" in blob:
+        return "correct_score"
+    if any(w in blob for w in ("total", "over/under", "over-under", "over_under")):
+        return "total_goals"
+    if "btts" in blob or "both teams" in blob:
+        return "btts"
+    if "scorer" in blob or "goalscorer" in blob:
+        return "scorer"
+    return None
+
+
+def _adi_orient_score(git: Optional[str], home: Optional[str],
+                      away: Optional[str]) -> Optional[str]:
+    """ADI groupItemTitle like '3-0' is home-first; orient to sorted-team order."""
+    if not git:
+        return None
+    m = re.search(r"(\d{1,2})\s*[-:]\s*(\d{1,2})", git)
+    if not m:
+        return None
+    x, y = m.group(1), m.group(2)
+    ca, cb = canon_team(home), canon_team(away)
+    teams = sorted(v for v in (ca, cb) if v)
+    if len(teams) == 2 and ca == teams[1]:
+        x, y = y, x
+    return f"{x}-{y}"
+
+
+def _adi_selection(ctype: Optional[str], git: Optional[str],
+                   home: Optional[str], away: Optional[str]) -> Optional[str]:
+    """Canonical selection from ADI groupItemTitle (the outcome label)."""
+    if not ctype:
+        return None
+    g = (git or "").strip()
+    if ctype == "match_winner":
+        if not g:
+            return None
+        if g.lower() in ("draw", "tie"):
+            return "draw"
+        return canon_team(g)
+    if ctype == "correct_score":
+        return _adi_orient_score(g, home, away)
+    if ctype == "total_goals":
+        mm = re.search(r"(over|under)\D*(\d+(?:\.\d+)?)", g.lower())
+        return f"{mm.group(1)}_{mm.group(2)}" if mm else None
+    if ctype == "btts":
+        if g.lower() in ("yes", "y"):
+            return "yes"
+        if g.lower() in ("no", "n"):
+            return "no"
+    return None
+
+
 def _adi_match_is_world_cup(match: dict) -> bool:
     if ADI_ASSUME_WORLD_CUP:
         return True
@@ -507,7 +610,18 @@ def _adi_normalize_match(match: dict) -> list[dict]:
             if mid is None:
                 continue
             status = m.get("status")
-            out.append(make_record(
+            tags = m.get("tags") or []
+            ctype = _adi_canon_type(tags)
+            csel = _adi_selection(ctype, m.get("groupItemTitle"),
+                                  ev_team_a, ev_team_b)
+            # Raw market type = the non-competition tag name (e.g. "MONEYLINE").
+            type_tag = next(
+                (t.get("name") for t in tags
+                 if isinstance(t, dict) and t.get("name")
+                 and t.get("slug") != "fifa-wc-2026"),
+                None,
+            )
+            rec = make_record(
                 platform=PLATFORM_ADI,
                 platform_market_id=mid,
                 platform_event_id=ev_id,
@@ -517,19 +631,24 @@ def _adi_normalize_match(match: dict) -> list[dict]:
                 match_name=match_title,
                 team_a=ev_team_a,
                 team_b=ev_team_b,
-                market_title=m.get("title") or m.get("question") or ev_title,
-                market_type=m.get("type") or m.get("marketType"),
+                market_title=m.get("question") or m.get("title") or ev_title,
+                market_type=type_tag,
                 market_url=_adi_market_url(m.get("slug"), ev_slug),
-                event_start_time=ev_start,
+                event_start_time=m.get("kickoff") or ev_start,
                 market_status=status,
                 is_active=(status or "").upper() in ("OPEN", "PRE_MARKET", "PAUSED"),
-                # Volume is reported at event level (USDC); attach to each market.
                 volume_total=to_float(m.get("totalVolume") or ev_vol_total),
                 volume_24h=to_float(m.get("volume24h") or ev_vol_24h),
                 volume_currency="USDC",
                 raw_updated_at=m.get("updatedAt") or ev.get("updatedAt"),
                 raw_json=m,
-            ))
+            )
+            # ADI gives structured type/outcome — pass them as canon overrides.
+            if ctype:
+                rec["canon_type_override"] = ctype
+                if csel:
+                    rec["canon_sel_override"] = csel
+            out.append(rec)
     return out
 
 
@@ -594,70 +713,92 @@ def _lmts_start_iso(m: dict) -> Optional[str]:
     return m.get("expirationDate") or None
 
 
+def _lmts_extract_markets(payload: object) -> list[dict]:
+    """Search/browse responses may be a list or wrap items under a key."""
+    if isinstance(payload, list):
+        return [x for x in payload if isinstance(x, dict)]
+    if isinstance(payload, dict):
+        for k in ("data", "markets", "results", "items"):
+            v = payload.get(k)
+            if isinstance(v, list):
+                return [x for x in v if isinstance(x, dict)]
+    return []
+
+
+def _lmts_record(m: dict) -> Optional[dict]:
+    slug = m.get("slug") or (str(m.get("id")) if m.get("id") else None)
+    if not slug:
+        return None
+    title = m.get("title") or ""
+    team_a, team_b = parse_teams(title)
+    expired = bool(m.get("expired"))
+    return make_record(
+        platform=PLATFORM_LMTS,
+        platform_market_id=slug,
+        platform_event_id=(str(m["conditionId"]) if m.get("conditionId") else None),
+        event_name=title,
+        match_name=title,
+        team_a=team_a,
+        team_b=team_b,
+        market_title=title,
+        market_type=m.get("marketType"),
+        market_url=f"https://limitless.exchange/markets/{slug}",
+        event_start_time=_lmts_start_iso(m),
+        market_status=m.get("status") or ("expired" if expired else "active"),
+        is_active=not expired,
+        volume_total=to_float(m.get("volumeFormatted") or m.get("volume")),
+        volume_24h=None,  # not exposed
+        volume_currency="USDC",
+        raw_json=m,
+    )
+
+
 def fetch_limitless() -> list[dict]:
     """
-    Discover World Cup markets on Limitless via /markets/active (paginated).
-    This endpoint returns full market objects with title + volume in USDC
-    (`volumeFormatted`, whole-USDC string) + openInterest + liquidity.
+    Discover World Cup markets on Limitless via /markets/search (semantic
+    search). The plain /markets/active route 400s (collides with /markets/:slug
+    detail lookup), so we query for World Cup terms instead. Returned objects
+    carry title + volume in USDC (`volumeFormatted`).
 
-    Notes:
-      - There's no 24h-volume field here, so volume_24h stays null; volume_total
-        is the all-time USDC volume (`volumeFormatted`).
-      - Set LMTS_AUTOMATION_TYPE=sports to fetch only auto-generated sports
-        markets (cheaper). Default scans all active markets and keyword-filters.
+    Each result is kept only if it looks like World Cup (keyword in
+    title/categories/tags) OR parses as a two-team match — semantic search can
+    return loosely related items, this keeps precision without dropping
+    "Team A vs Team B" titles that omit the words "world cup".
     """
-    items: list[dict] = []
-    page = 1
-    while page <= LMTS_MAX_PAGES:
-        params: dict[str, object] = {"page": page, "limit": 100, "sortBy": "newest"}
-        if LMTS_AUTOMATION_TYPE:
-            params["automationType"] = LMTS_AUTOMATION_TYPE
-        payload = http_get_json(f"{LMTS_API_URL}/markets/active", params=params)
-        data = payload.get("data") if isinstance(payload, dict) else None
-        if not data:
-            break
-        items.extend(data)
-        total = int(payload.get("totalMarketsCount") or 0)
-        if len(data) < 100 or page * 100 >= total:
-            break
-        page += 1
-
     records: list[dict] = []
     seen: set[str] = set()
-    for m in _lmts_flatten(items):
-        slug = m.get("slug") or (str(m.get("id")) if m.get("id") else None)
-        if not slug or slug in seen:
-            continue
-        title = m.get("title") or ""
-        cats = " ".join(str(c) for c in (m.get("categories") or []))
-        tags = " ".join(str(t) for t in (m.get("tags") or []))
-        if not text_is_world_cup(title, m.get("description"), cats, tags, slug):
-            continue
-        seen.add(slug)
-        team_a, team_b = parse_teams(title)
-        expired = bool(m.get("expired"))
-        records.append(make_record(
-            platform=PLATFORM_LMTS,
-            platform_market_id=slug,
-            platform_event_id=(str(m["conditionId"]) if m.get("conditionId") else None),
-            event_name=title,
-            match_name=title,
-            team_a=team_a,
-            team_b=team_b,
-            market_title=title,
-            market_type=m.get("marketType"),
-            market_url=f"https://limitless.exchange/markets/{slug}",
-            event_start_time=_lmts_start_iso(m),
-            market_status=m.get("status") or ("expired" if expired else "active"),
-            is_active=not expired,
-            volume_total=to_float(m.get("volumeFormatted")),  # whole USDC
-            volume_24h=None,  # not exposed by this endpoint
-            volume_currency="USDC",
-            raw_updated_at=None,
-            raw_json=m,
-        ))
-    log.info("limitless: %d World Cup markets (USDC volume) from %d active",
-             len(records), len(items))
+    for query in LMTS_SEARCH_QUERIES:
+        page = 1
+        while page <= LMTS_MAX_PAGES:
+            params = {
+                "query": query, "limit": 50, "page": page,
+                "similarityThreshold": LMTS_SIMILARITY,
+            }
+            try:
+                payload = http_get_json(f"{LMTS_API_URL}/markets/search", params=params)
+            except Exception as e:  # noqa: BLE001 — one query failing is fine
+                log.warning("limitless search %r p%d failed: %s", query, page, e)
+                break
+            ms = _lmts_extract_markets(payload)
+            if not ms:
+                break
+            for m in _lmts_flatten(ms):
+                rec = _lmts_record(m)
+                if rec is None or rec["platform_market_id"] in seen:
+                    continue
+                title = m.get("title") or ""
+                cats = " ".join(str(c) for c in (m.get("categories") or []))
+                tags = " ".join(str(t) for t in (m.get("tags") or []))
+                team_a, team_b = parse_teams(title)
+                if not (text_is_world_cup(title, cats, tags, rec["platform_market_id"])
+                        or (team_a and team_b)):
+                    continue
+                seen.add(rec["platform_market_id"])
+                records.append(rec)
+            if len(ms) < 50:
+                break
+            page += 1
+    log.info("limitless: %d World Cup markets via search", len(records))
     return records
 
 
@@ -729,6 +870,65 @@ TEAM_ALIASES: dict[str, str] = {
     "jamaica": "JAM", "jam": "JAM",
     "newzealand": "NZL", "nzl": "NZL",
     "southafrica": "RSA", "rsa": "RSA",
+    "haiti": "HAI", "hai": "HAI",
+    "uzbekistan": "UZB", "uzb": "UZB",
+    "jordan": "JOR", "jor": "JOR",
+    "capeverde": "CPV", "caboverde": "CPV", "cpv": "CPV",
+    "curacao": "CUW", "cuw": "CUW",
+    "panama": "PAN",
+    "honduras": "HON", "hon": "HON",
+    "elsalvador": "SLV", "slv": "SLV",
+    "guatemala": "GUA", "gua": "GUA",
+    "venezuela": "VEN", "ven": "VEN",
+    "bolivia": "BOL", "bol": "BOL",
+    "iraq": "IRQ", "irq": "IRQ",
+    "unitedarabemirates": "UAE", "uae": "UAE",
+    "uae": "UAE",
+    "ivorycoast2": "CIV",
+    "drcongo": "COD", "congodr": "COD", "cod": "COD",
+    "mali": "MLI", "mli": "MLI",
+    "burkinafaso": "BFA", "bfa": "BFA",
+    "northmacedonia": "MKD", "mkd": "MKD",
+    "slovenia": "SVN", "svn": "SVN",
+    "slovakia": "SVK", "svk": "SVK",
+    "czechia": "CZE", "czechrepublic": "CZE", "cze": "CZE",
+    "hungary": "HUN", "hun": "HUN",
+    "romania": "ROU", "rou": "ROU",
+    "greece": "GRE", "gre": "GRE",
+    "sweden": "SWE", "swe": "SWE",
+    "finland": "FIN", "fin": "FIN",
+    "ireland": "IRL", "republicofireland": "IRL", "irl": "IRL",
+    "northernireland": "NIR", "nir": "NIR",
+    "albania": "ALB", "alb": "ALB",
+    "georgia": "GEO", "geo": "GEO",
+    "russia": "RUS", "rus": "RUS",
+    "china": "CHN", "chn": "CHN",
+    "indonesia": "IDN", "idn": "IDN",
+    "thailand": "THA", "tha": "THA",
+    "vietnam": "VIE", "vie": "VIE",
+    "india": "IND", "ind": "IND",
+    "kuwait": "KUW", "kuw": "KUW",
+    "bahrain": "BHR", "bhr": "BHR",
+    "oman": "OMA", "oma": "OMA",
+    "palestine": "PLE", "ple": "PLE",
+    "syria": "SYR", "syr": "SYR",
+    "lebanon": "LBN", "lbn": "LBN",
+    "kenya": "KEN", "ken": "KEN",
+    "zambia": "ZAM", "zam": "ZAM",
+    "angola": "ANG", "ang": "ANG",
+    "gabon": "GAB", "gab": "GAB",
+    "guinea": "GUI", "gui": "GUI",
+    "benin": "BEN", "ben": "BEN",
+    "togo": "TOG", "tog": "TOG",
+    "ugandacranes": "UGA", "uganda": "UGA", "uga": "UGA",
+    "tanzania": "TAN", "tan": "TAN",
+    "mozambique": "MOZ", "moz": "MOZ",
+    "madagascar": "MAD", "mad": "MAD",
+    "namibia": "NAM", "nam": "NAM",
+    "mauritania": "MTN", "mtn": "MTN",
+    "trinidadandtobago": "TRI", "tri": "TRI",
+    "suriname": "SUR", "sur": "SUR",
+    "nicaragua": "NCA", "nca": "NCA",
 }
 
 
@@ -748,20 +948,52 @@ def canon_team(name: Optional[str]) -> Optional[str]:
     return letters[:16]
 
 
-def canon_market_type(title: Optional[str], src_type: Optional[str]) -> str:
-    t = f"{src_type or ''} {title or ''}".lower()
-    if "correct score" in t or re.search(r"\b\d{1,2}\s*[-:]\s*\d{1,2}\b", t):
+_STAT_RE = re.compile(
+    r"\b(shots?|assists?|saves?|tackles?|passes?|cards?|fouls?|offsides?|"
+    r"clearances?|interceptions?|touches?|crosses?)\b", re.IGNORECASE
+)
+
+
+def _title_is_team_or_draw(t: str, team_a: Optional[str], team_b: Optional[str]) -> bool:
+    """True if the (short) title is essentially just a team name or draw/tie."""
+    bare = re.sub(r"[^a-z]", "", t)
+    if bare in ("draw", "tie"):
+        return True
+    ct = canon_team(t)  # canon of whole title; bridges 'Brazil' vs code 'BRA'
+    for name in (team_a, team_b):
+        c = canon_team(name)
+        if c and ct and ct == c:
+            return True
+    return False
+
+
+def canon_market_type(
+    title: Optional[str], team_a: Optional[str] = None, team_b: Optional[str] = None,
+) -> str:
+    t = (title or "").lower()
+    # Player props first (named player + a stat), so they don't masquerade as
+    # match markets just because the event has two teams.
+    if _STAT_RE.search(t):
+        return "player_prop"
+    if ("scor" in t or "goal" in t) and ("first" in t or "anytime" in t or "last" in t):
+        return "scorer"
+    if "correct score" in t or re.search(r"(?<!\d)\d{1,2}\s*[-:]\s*\d{1,2}(?!\d)", t):
         return "correct_score"
     if "both teams" in t or "btts" in t:
         return "btts"
     if "total goals" in t or "o/u" in t or re.search(r"\b(over|under)\b", t):
         return "total_goals"
-    if ("scor" in t or "goal" in t) and ("first" in t or "anytime" in t or "last" in t):
-        return "first_scorer"
+    # Tournament-level outright (win the World Cup / group / golden boot).
+    if re.search(r"\b(world cup|the group|the tournament|the title|outright|"
+                 r"top scorer|golden boot)\b", t) and \
+       re.search(r"\b(win|winner|qualify|advance|reach|lift|finish)\b", t):
+        return "outright"
     if any(w in t for w in ("qualify", "advance", "to reach", "progress", "knockout")):
         return "to_qualify"
-    if any(w in t for w in ("to win", "winner", "1x2", "moneyline",
-                            "match result", "draw", " beat ", " win ", "to lift")):
+    # Match winner: explicit wording OR the title is just a team / draw.
+    if re.search(r"\b(win|wins|winner|beat|beats|moneyline|1x2|match result|"
+                 r"double chance|to lift)\b", t) \
+       or _title_is_team_or_draw(t, team_a, team_b):
         return "match_winner"
     return "other"
 
@@ -812,30 +1044,40 @@ def canon_selection(
     if mtype == "btts":
         return "no" if re.search(r"\b(no|ng)\b", t) else "yes"
     if mtype == "match_winner":
-        if "draw" in t or " tie" in t:
+        if re.search(r"\b(draw|tie)\b", t):
             return "draw"
-        for name in (team_a, team_b):
-            code = canon_team(name)
-            if name and code and (name.lower() in t or code.lower() in t):
-                return code
-        return "winner"
+        ct = canon_team(title)
+        ca, cb = canon_team(team_a), canon_team(team_b)
+        if ct and ct == ca:
+            return ca
+        if ct and ct == cb:
+            return cb
+        first = _first_team_code(title, team_a, team_b)
+        return first or "winner"
     return "na"
+
+
+# Only these bet types are aligned across platforms; others stay ungrouped.
+GROUPABLE_TYPES = {"match_winner", "correct_score", "total_goals", "btts"}
 
 
 def compute_keys(rec: dict) -> tuple[Optional[str], Optional[str], str, str]:
     """Return (match_key, group_key, market_type_canon, selection)."""
     ca, cb = canon_team(rec.get("team_a")), canon_team(rec.get("team_b"))
     teams = sorted(x for x in (ca, cb) if x)
-    mtype = canon_market_type(rec.get("market_title"), rec.get("market_type"))
-    sel = canon_selection(mtype, rec.get("market_title"),
-                          rec.get("team_a"), rec.get("team_b"))
+    # Adapters with structured metadata (e.g. ADI) can override canon directly.
+    mtype = rec.get("canon_type_override") or canon_market_type(
+        rec.get("market_title"), rec.get("team_a"), rec.get("team_b"))
+    sel = rec.get("canon_sel_override") or canon_selection(
+        mtype, rec.get("market_title"), rec.get("team_a"), rec.get("team_b"))
+    match_key = group_key = None
     if len(teams) == 2:
         match_key = hashlib.sha1("|".join(teams).encode()).hexdigest()[:16]
-        group_key = hashlib.sha1(
-            "|".join(teams + [mtype, sel]).encode()
-        ).hexdigest()[:16]
-    else:
-        match_key = group_key = None  # not enough structure to group reliably
+        # Group only alignable bet types, and only with a concrete selection.
+        if mtype in GROUPABLE_TYPES and sel not in ("winner", "na", "cs", "ou"):
+            group_key = hashlib.sha1(
+                "|".join(teams + [mtype, sel]).encode()
+            ).hexdigest()[:16]
     return match_key, group_key, mtype, sel
 
 
@@ -963,7 +1205,7 @@ def upsert_markets(sb, records: list[dict]) -> int:
         # first_seen_at intentionally omitted → DB default on insert, kept on update.
         rows.append(row)
     written = 0
-    for chunk in _chunks(rows, 200):
+    for chunk in _chunks(rows, 500):
         sb.table("markets_normalized").upsert(
             chunk, on_conflict="platform,platform_market_id"
         ).execute()
@@ -987,7 +1229,7 @@ def insert_snapshots(sb, records: list[dict]) -> int:
         "raw_json": r["raw_json"],
     } for r in records]
     written = 0
-    for chunk in _chunks(rows, 200):
+    for chunk in _chunks(rows, 500):
         sb.table("market_snapshots").insert(chunk).execute()
         written += len(chunk)
     return written
@@ -1023,7 +1265,7 @@ def upsert_groups(sb, groups: list[dict]) -> int:
     now = NOW()
     seen = {g["group_key"] for g in groups}
     rows = [{**g, "updated_at": now} for g in groups]
-    for chunk in _chunks(rows, 200):
+    for chunk in _chunks(rows, 500):
         sb.table("market_groups").upsert(chunk, on_conflict="group_key").execute()
 
     # Mark groups that have no active members this run as inactive.
