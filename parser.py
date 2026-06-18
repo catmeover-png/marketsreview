@@ -1271,7 +1271,7 @@ def build_groups(records: list[dict]) -> list[dict]:
     for g in buckets.values():
         platforms = sorted(g.pop("_platforms"))
         volumes = {p: {"total": round(v["total"], 4),
-                       "volume_24h": round(v["h24"], 4)
+                       "volume_24h": round(v["h24"], 4),
                        "h24": round(v["h24"], 4),
                        "currency": v["currency"]}
                    for p, v in g.pop("_vol").items()}
