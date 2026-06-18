@@ -1575,7 +1575,7 @@ def main() -> None:
                 sb, 
                 platform, 
                 seen_by_platform[platform], 
-                prev_state.get(platform, {}))
+                prev_state.get(platform, {}),
             )
             closed_totsl +=closed
             summary.append(f"{platform}: deleted {closed}")
