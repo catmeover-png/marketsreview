@@ -1577,7 +1577,7 @@ def main() -> None:
                 seen_by_platform[platform], 
                 prev_state.get(platform, {}),
             )
-            closed_totsl +=closed
+            closed_total +=closed
             summary.append(f"{platform}: deleted {closed}")
         except Exception:
             log.exception("%s: delete-missing failed", platform)
