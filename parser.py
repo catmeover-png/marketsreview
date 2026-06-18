@@ -110,7 +110,7 @@ WORLD_CUP_KEYWORDS = [
 
 # --- Source endpoints (all documented public bases) ---
 GAMMA_API_URL = _env("GAMMA_API_URL", "https://gamma-api.polymarket.com")
-KALSHI_API_URL = _env("KALSHI_API_URL", "https://api.elections.kalshi.com/trade-api/v2")
+KALSHI_API_URL = _env("KALSHI_API_URL", "https://external-api.kalshi.com/trade-api/v2")
 ADI_API_URL = _env("ADI_API_URL", "https://core-api.adipredictstreet.com")
 LMTS_API_URL = _env("LMTS_API_URL", "https://api.limitless.exchange")
 # --- Source-specific discovery hints (optional, improve precision) ---
