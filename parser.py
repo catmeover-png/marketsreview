@@ -1571,7 +1571,17 @@ def main() -> None:
     closed_total = 0
     for platform in seen_by_platform:
         try:
-            closed = delete_missing(sb, platform, seen_by_platform[platform], prev_state.get(platform, {}))
+            closed = delete_missing(
+                sb, 
+                platform, 
+                seen_by_platform[platform], 
+                prev_state.get(platform, {}))
+            )
+            closed_totsl +=closed
+            summary.append(f"{platform}: deleted {closed}")
+        except Exception:
+            log.exception("%s: delete-missing failed", platform)
+            
     # Build + persist cross-platform groups (same bet across platforms).
     groups = build_groups(all_records)
     multi = sum(1 for g in groups if g["platform_count"] >= 2)
