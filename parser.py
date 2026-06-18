@@ -130,8 +130,9 @@ KALSHI_MAX_PAGES = _env_int("KALSHI_MAX_PAGES", 50)
 # active tournament on ADI is the World Cup; set false to require a keyword/tag.
 ADI_ASSUME_WORLD_CUP = _env_bool("ADI_ASSUME_WORLD_CUP", True)
 ADI_TAG = _env("ADI_TAG")  # optional single tag slug to filter /api/matches
-# Limitless: discovery via semantic search (/markets/search). Tune queries and
-# similarity floor; results still pass a WC/team sanity check.
+# Limitless: primary discovery is the deterministic /markets/active browse
+# (optionally scoped to the World Cup category via LMTS_CATEGORY_ID). Semantic
+# /markets/search is kept as a fallback. Tune queries / similarity floor.
 LMTS_SEARCH_QUERIES = [
     q.strip() for q in
     _env("LMTS_SEARCH_QUERIES", "FIFA World Cup,World Cup soccer").split(",")
@@ -139,6 +140,7 @@ LMTS_SEARCH_QUERIES = [
 ]
 LMTS_SIMILARITY = _env_float("LMTS_SIMILARITY", 0.4)
 LMTS_MAX_PAGES = _env_int("LMTS_MAX_PAGES", 10)
+LMTS_CATEGORY_ID = _env("LMTS_CATEGORY_ID")  # опц. числовой id категории WC (точность)
 
 PLATFORM_POLY = "polymarket"
 PLATFORM_KALSHI = "kalshi"
@@ -401,9 +403,16 @@ def fetch_polymarket() -> list[dict]:
 # === SOURCE: KALSHI =========================================================
 # ============================================================================
 
-def _kalshi_market_url(event_ticker: Optional[str]) -> Optional[str]:
-    # Best-effort; Kalshi canonical URLs are series/event based.
-    return f"https://kalshi.com/markets/{event_ticker}" if event_ticker else None
+def _kalshi_market_url(series_ticker: Optional[str],
+                       event_ticker: Optional[str] = None) -> Optional[str]:
+    # Веб-URL Kalshi: серия первой, в нижнем регистре, напр.
+    #   https://kalshi.com/markets/kxmenworldcup/.../kxmenworldcup-26
+    # Человекочитаемого slug в API нет — ведём на страницу серии (резолвится).
+    if series_ticker:
+        return f"https://kalshi.com/markets/{series_ticker.lower()}"
+    if event_ticker:  # серия = префикс event-тикера до первого '-'
+        return f"https://kalshi.com/markets/{event_ticker.split('-')[0].lower()}"
+    return None
 
 
 def _kalshi_status_active(status: Optional[str]) -> bool:
@@ -436,7 +445,7 @@ def _kalshi_normalize_event(ev: dict) -> list[dict]:
             team_b=team_b,
             market_title=m_title,
             market_type=m.get("market_type"),
-            market_url=_kalshi_market_url(event_ticker),
+            market_url=_kalshi_market_url(series_ticker, event_ticker),
             event_start_time=m.get("open_time") or ev.get("open_time"),
             market_status=status,
             is_active=_kalshi_status_active(status),
@@ -511,9 +520,12 @@ def fetch_kalshi() -> list[dict]:
 # === SOURCE: ADI PREDICTSTREET ==============================================
 # ============================================================================
 
-def _adi_market_url(market_slug: Optional[str], event_slug: Optional[str]) -> Optional[str]:
-    slug = market_slug or event_slug
-    return f"https://app.adipredictstreet.com/markets/{slug}" if slug else None
+def _adi_market_url(match_slug: Optional[str], event_slug: Optional[str] = None,
+                    market_slug: Optional[str] = None) -> Optional[str]:
+    # Фронт ADI: страница матча — adipredictstreet.com/match/{match_slug}
+    # напр. /match/fifwc-cze-rsa-2026-06-18
+    slug = match_slug or event_slug or market_slug
+    return f"https://adipredictstreet.com/match/{slug}" if slug else None
 
 
 def _adi_canon_type(tags: list) -> Optional[str]:
@@ -641,7 +653,7 @@ def _adi_normalize_match(match: dict) -> list[dict]:
                 team_b=ev_team_b,
                 market_title=m.get("question") or m.get("title") or ev_title,
                 market_type=type_tag,
-                market_url=_adi_market_url(m.get("slug"), ev_slug),
+                market_url=_adi_market_url(match_slug, ev_slug, m.get("slug")),
                 event_start_time=m.get("kickoff") or ev_start,
                 market_status=status,
                 is_active=(status or "").upper() in ("OPEN", "PRE_MARKET", "PAUSED"),
@@ -695,22 +707,6 @@ def fetch_adi() -> list[dict]:
 # === SOURCE: LIMITLESS ======================================================
 # ============================================================================
 
-def _lmts_flatten(items: list) -> list[dict]:
-    """A group entry nests its child markets under `markets: [...]`; flatten."""
-    flat: list[dict] = []
-    for it in items:
-        if not isinstance(it, dict):
-            continue
-        nested = it.get("markets")
-        if isinstance(nested, list) and nested:
-            for child in nested:
-                if isinstance(child, dict):
-                    flat.append(child)
-        else:
-            flat.append(it)
-    return flat
-
-
 def _lmts_start_iso(m: dict) -> Optional[str]:
     ets = m.get("expirationTimestamp")
     if ets:
@@ -733,29 +729,61 @@ def _lmts_extract_markets(payload: object) -> list[dict]:
     return []
 
 
-def _lmts_record(m: dict) -> Optional[dict]:
+def _lmts_iter_active(category_id: Optional[str]) -> list[dict]:
+    """
+    Страничный обход /markets/active (опц. /markets/active/{categoryId}).
+    Возвращает сырые элементы (одиночные маркеты И группы с детьми).
+    """
+    base = f"{LMTS_API_URL}/markets/active"
+    if category_id:
+        base = f"{base}/{category_id}"
+    out: list[dict] = []
+    page = 1
+    while page <= LMTS_MAX_PAGES:
+        try:
+            payload = http_get_json(
+                base, params={"page": page, "limit": 100, "sortBy": "newest"})
+        except Exception as e:  # noqa: BLE001 — одна страница падает — не валим источник
+            log.warning("limitless active p%d failed: %s", page, e)
+            break
+        items = _lmts_extract_markets(payload)
+        if not items:
+            break
+        out.extend(items)
+        total = payload.get("totalMarketsCount") if isinstance(payload, dict) else None
+        if len(items) < 100 or (total is not None and len(out) >= total):
+            break
+        page += 1
+    return out
+
+
+def _lmts_record(m: dict, parent: Optional[dict] = None) -> Optional[dict]:
     slug = m.get("slug") or (str(m.get("id")) if m.get("id") else None)
     if not slug:
         return None
     title = m.get("title") or ""
-    team_a, team_b = parse_teams(title)
+    # У ребёнка группы title — это исход; «Team A vs Team B» лежит на родителе.
+    match_title = (parent or {}).get("title") or title
+    team_a, team_b = parse_teams(match_title)
     expired = bool(m.get("expired"))
+    cond = m.get("conditionId") or (parent or {}).get("conditionId")
     return make_record(
         platform=PLATFORM_LMTS,
         platform_market_id=slug,
-        platform_event_id=(str(m["conditionId"]) if m.get("conditionId") else None),
-        event_name=title,
-        match_name=title,
+        platform_event_id=(str(cond) if cond else None),
+        competition_slug=(parent or {}).get("slug"),
+        event_name=match_title,
+        match_name=match_title,
         team_a=team_a,
         team_b=team_b,
-        market_title=title,
+        market_title=title or match_title,
         market_type=m.get("marketType"),
         market_url=f"https://limitless.exchange/markets/{slug}",
         event_start_time=_lmts_start_iso(m),
         market_status=m.get("status") or ("expired" if expired else "active"),
         is_active=not expired,
         volume_total=to_float(m.get("volumeFormatted") or m.get("volume")),
-        volume_24h=None,  # not exposed
+        volume_24h=None,  # не отдаётся
         volume_currency="USDC",
         raw_json=m,
     )
@@ -763,50 +791,75 @@ def _lmts_record(m: dict) -> Optional[dict]:
 
 def fetch_limitless() -> list[dict]:
     """
-    Discover World Cup markets on Limitless via /markets/search (semantic
-    search). The plain /markets/active route 400s (collides with /markets/:slug
-    detail lookup), so we query for World Cup terms instead. Returned objects
-    carry title + volume in USDC (`volumeFormatted`).
+    Дискавери WC-маркетов на Limitless.
 
-    Each result is kept only if it looks like World Cup (keyword in
-    title/categories/tags) OR parses as a two-team match — semantic search can
-    return loosely related items, this keeps precision without dropping
-    "Team A vs Team B" titles that omit the words "world cup".
+    Основной путь — обход /markets/active (опц. по категории WC через
+    LMTS_CATEGORY_ID): детерминированно, ловит и group-матчи, и одиночные.
+    Для групп эмитим родителя (несёт «A vs B» + агрегатный объём — это и есть
+    публичный URL матча) и детей с проброшенным title родителя, чтобы тиминг
+    и кросс-платформенная группировка работали. Семантический /markets/search
+    оставлен fallback'ом — добирает то, чего нет в выбранной категории.
+
+    Заметка про объём: родитель-группа («Czech Republic vs South Africa») по
+    canon_market_type уходит в "other" → без group_key → в build_groups НЕ
+    агрегируется (остаётся просто строкой матча с нужным URL). Дети дают
+    match_winner+selection и группируются с другими площадками. Двойного счёта
+    объёма нет.
     """
     records: list[dict] = []
     seen: set[str] = set()
+
+    def _consider(rec: Optional[dict], src: dict, parent: Optional[dict]) -> None:
+        if rec is None or rec["platform_market_id"] in seen:
+            return
+        title = src.get("title") or ""
+        ptitle = (parent or {}).get("title") or ""
+        host = parent or src
+        cats = " ".join(str(c) for c in (host.get("categories") or []))
+        tags = " ".join(str(t) for t in (host.get("tags") or []))
+        ta, tb = parse_teams(ptitle or title)
+        if not (text_is_world_cup(title, ptitle, cats, tags, rec["platform_market_id"])
+                or (ta and tb)):
+            return
+        seen.add(rec["platform_market_id"])
+        records.append(rec)
+
+    def _ingest(items: Iterable[dict]) -> None:
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            nested = it.get("markets")
+            if isinstance(nested, list) and nested:
+                _consider(_lmts_record(it), it, None)            # сам матч/группа
+                for child in nested:
+                    if isinstance(child, dict):
+                        _consider(_lmts_record(child, parent=it), child, it)
+            else:
+                _consider(_lmts_record(it), it, None)
+
+    # 1) Активные маркеты (+ дети групп) — основной, детерминированный путь.
+    _ingest(_lmts_iter_active(LMTS_CATEGORY_ID or None))
+
+    # 2) Fallback: семантический поиск — добирает то, что мимо категории.
     for query in LMTS_SEARCH_QUERIES:
         page = 1
         while page <= LMTS_MAX_PAGES:
-            params = {
-                "query": query, "limit": 50, "page": page,
-                "similarityThreshold": LMTS_SIMILARITY,
-            }
+            params = {"query": query, "limit": 50, "page": page,
+                      "similarityThreshold": LMTS_SIMILARITY}
             try:
                 payload = http_get_json(f"{LMTS_API_URL}/markets/search", params=params)
-            except Exception as e:  # noqa: BLE001 — one query failing is fine
+            except Exception as e:  # noqa: BLE001 — одна выдача падает — продолжаем
                 log.warning("limitless search %r p%d failed: %s", query, page, e)
                 break
             ms = _lmts_extract_markets(payload)
             if not ms:
                 break
-            for m in _lmts_flatten(ms):
-                rec = _lmts_record(m)
-                if rec is None or rec["platform_market_id"] in seen:
-                    continue
-                title = m.get("title") or ""
-                cats = " ".join(str(c) for c in (m.get("categories") or []))
-                tags = " ".join(str(t) for t in (m.get("tags") or []))
-                team_a, team_b = parse_teams(title)
-                if not (text_is_world_cup(title, cats, tags, rec["platform_market_id"])
-                        or (team_a and team_b)):
-                    continue
-                seen.add(rec["platform_market_id"])
-                records.append(rec)
+            _ingest(ms)
             if len(ms) < 50:
                 break
             page += 1
-    log.info("limitless: %d World Cup markets via search", len(records))
+
+    log.info("limitless: %d World Cup markets (active+search)", len(records))
     return records
 
 
@@ -883,7 +936,6 @@ TEAM_ALIASES: dict[str, str] = {
     "jordan": "JOR", "jor": "JOR",
     "capeverde": "CPV", "caboverde": "CPV", "cpv": "CPV",
     "curacao": "CUW", "cuw": "CUW",
-    "panama": "PAN",
     "honduras": "HON", "hon": "HON",
     "elsalvador": "SLV", "slv": "SLV",
     "guatemala": "GUA", "gua": "GUA",
@@ -891,8 +943,6 @@ TEAM_ALIASES: dict[str, str] = {
     "bolivia": "BOL", "bol": "BOL",
     "iraq": "IRQ", "irq": "IRQ",
     "unitedarabemirates": "UAE", "uae": "UAE",
-    "uae": "UAE",
-    "ivorycoast2": "CIV",
     "drcongo": "COD", "congodr": "COD", "cod": "COD",
     "mali": "MLI", "mli": "MLI",
     "burkinafaso": "BFA", "bfa": "BFA",
